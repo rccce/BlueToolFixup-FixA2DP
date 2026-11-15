@@ -2,7 +2,7 @@
 //  BlueToolFixupVerifyFix.hpp
 //  BrcmPatchRAM
 //
-//  "verify-fix" for BlueToolFixup (AX210 report, section 12 and appendix G), revision 2 (report v9).
+//  "verify-fix" for BlueToolFixup (AX210 report, section 12 and appendix G), revision 3 (report v10).
 //  Keeps bluetoothd from failing with "Data hash mismatch" (EBADMSG, SIGBUS) on macOS 26, where APFS
 //  verifies compressed system files in 16 KB blocks that include pages we patched.
 //
@@ -14,23 +14,31 @@
 //   3. after  SYSLOG(MODULE_SHORT, "failed to route cs validation pages");  in pluginStart()
 //          else
 //              VerifyFix::init(patcher);
-//  The edits are the same as for revision 1: if they are already in place, replacing this file is enough.
+//  The edits are the same as for revisions 1 and 2: if they are already in place, replacing this file is enough.
 //
 //  Written for the hexxyan/BlueToolFixup-FixA2DP fork (branch fix-a2dp-fastconnect, d8bd62a); the same
 //  three edits also apply to acidanthera/BrcmPatchRAM master (4fdd4d4). The file relies only on the Lilu
 //  headers, the Kernel.framework headers and MODULE_SHORT, which BlueToolFixup.cpp provides before the include.
 //
-//  Changes in revision 2:
-//   - Layer 1 hooks the vnop_verify entry of APFS's vnode operation vector. Revision 1 routed the exported
-//     VNOP_VERIFY, but the macOS 26 kernel inlines VNOP_VERIFY into decmpfs and the cluster code, so that
-//     route never ran (report 12.10). Every inlined copy still calls through vp->v_op[], so the vector
-//     entry catches all of them.
-//   - Layer 2 drops the range of the failed page-in first, then the whole file.
-//   - Status counters in  sysctl debug.btlfx : on this setup Lilu's log lines reach dmesg, but not the
-//     unified log (log show).
+//  Revision 2 moved layer 1 from the exported VNOP_VERIFY (inlined everywhere on macOS 26, so that route
+//  never ran) to the vnop_verify entry of the APFS vnode operation vector, which every inlined copy calls.
+//  Revision 3 (review of revision 2, report 12.11) changes only layer 1:
+//   - The vnop_verify argument block is declared here (layout of macOS 13 and later). Revision 2 used the
+//     SDK's struct vnop_verify_args, but MacKernelSDK is based on the macOS 11 SDK, where a_verify_ctxp
+//     probably does not exist yet. The fields used for verifying (a_desc to a_verifyblksize) have not moved
+//     since macOS 11; a_verify_ctxp and a_flags only decide whether to take over.
+//   - The wrapper only handles argument blocks whose a_desc is vnop_verify_desc; anything else passes on.
+//   - Layer 1 is installed from a thread call, no longer inside cs_validate_page. The vector found in the
+//     vnode of the patched file must be confirmed by a second system file in another directory (/bin/ls):
+//     same position in the vnode, same vector. Every entry up to the vnop_verify slot must be a kernel
+//     pointer, and the vnop_verify entry must differ from the default entry.
+//   - The entry is replaced with Lilu's kernel write enable (MachInfo::setKernelWriting), so a
+//     write-protected vector cannot cause a panic.
+//   - sysctl debug.btlfx also shows where v_op was found (voff=) and foreign argument blocks (baddesc=).
 //
-//  Status: compiled with g++ against stand-in headers and run in a user-space test with a simulated vnode,
-//  vnode operation vector and APFS verifier. NOT compiled with Xcode, NOT tested on macOS.
+//  Status: type-checked with g++ against stand-in headers; this environment has no assembler or linker,
+//  so the C++ was not run. The logic was run as a step-by-step Python model (report appendix G).
+//  NOT compiled with Xcode, NOT tested on macOS.
 //
 
 #ifndef BlueToolFixupVerifyFix_hpp
@@ -76,14 +84,14 @@
 //   a tracked file still contains bytes that we patched, verify a private copy of that block in which
 //   exactly those bytes are put back to their recorded original values. The live pages are never
 //   written, so running threads are unaffected, and any other difference from the sealed data is still
-//   detected. Installed from the vnode of the first file we patch; every other call passes straight on.
+//   detected. Installed from a thread call after the first patch; every other call passes straight on.
 // Layer 2 (heal): wrap decmpfs_pagein_compressed. If a page-in of a tracked file still fails with
 //   EBADMSG, drop the cached pages of that file from a thread call: first the range of the failed
 //   page-in, then the whole file. The next fault pages whole blocks in again (all pages absent, so the
 //   hash matches). Measured on 26.7.3 with revision 1: the faulting reader even survived (report 12.10).
 //
 // Status: sysctl debug.btlfx, for example
-//   vf9 l1=on slot=47 l2=on files=1 sites=5 | l1: calls=812 restored=2 restore_failed=0 skipped=0 flags=0x0 | l2: failed_pageins=0 heals=0 heal_error=0
+//   verifyfix r3 l1=on slot=47 voff=0xd0 l2=on files=1 sites=5 | l1: calls=812 restored=2 restore_failed=0 skipped=0 flags=0x0 baddesc=0 | l2: failed_pageins=0 heals=0 heal_error=0
 //
 // Boot-args: -btlfxnoverify disables layer 1, -btlfxnoheal disables layer 2.
 //
@@ -100,16 +108,23 @@ static constexpr size_t MergeGap     = 8;
 static constexpr size_t VnodeScanFrom = 0x40;
 static constexpr size_t VnodeScanTo   = 0x100;
 static constexpr int    MaxVnopSlot   = 256;
+// Second file for confirming the vector: a regular file on the system volume in another directory, so that
+// a per-file field such as v_parent cannot pass for v_op.
+static const char * const CrossCheckFiles[] = {"/bin/ls", "/bin/sh"};
 
 enum : int {
 	L1Off = 0,          // -btlfxnoverify, or no memory
-	L1Waiting = 1,      // ready, installed when the first patch is recorded
-	L1On = 2,           // vnop_verify entry of the APFS vector replaced
-	L1NoDesc = -1,      // _vnop_verify_desc not found, or not what we expect
-	L1NotApfs = -2,     // the patched file is not on APFS
-	L1NoOpVector = -3,  // v_mount/v_data pair not found in the vnode
-	L1BadVector = -4,   // the vector does not look like a vnode operation vector
-	L1Raced = -5,       // the entry changed while we replaced it
+	L1Waiting = 1,      // ready; queued when the first patch is recorded
+	L1Queued = 2,       // installation thread call queued
+	L1On = 3,           // vnop_verify entry of the APFS vector replaced
+	L1NoDesc = -1,      // _vnop_verify_desc not found, not what we expect, or no slot assigned
+	L1NoVnode = -2,     // vnode_lookup of the patched file failed
+	L1NotApfs = -3,     // the patched file is not on APFS
+	L1NoOpVector = -4,  // v_mount/v_data pair not found in the vnode
+	L1CrossCheck = -5,  // no second file showed the same vector at the same position
+	L1BadVector = -6,   // the vector does not look like a vnode operation vector
+	L1WriteFailed = -7, // kernel write enable failed
+	L1Raced = -8,       // the entry changed while we replaced it
 };
 
 struct Site {
@@ -135,26 +150,50 @@ struct Counters {
 	uint32_t restoreFailed;   // ... and failed anyway (real damage, or bytes we did not record)
 	uint32_t skipped;         // calls with a verify context or flags: passed on unchanged
 	uint32_t lastSkipFlags;
+	uint32_t badDesc;         // calls whose argument block is not vnop_verify's (counts up to 1000)
 	uint32_t pageinFailed;    // page-ins of a tracked file that returned EBADMSG
 	uint32_t heals;           // heal runs
 	int32_t  healError;       // result of the last heal run
 };
 
-using VerifyOp = int (*)(struct vnop_verify_args *);
+// Argument block of vnop_verify on macOS 13 and later: VNOP_VERIFY() (bsd/vfs/kpi_vfs.c) fills it and calls
+// vp->v_op[vnop_verify_desc.vdesc_offset](&a). Declared here instead of taken from the SDK, because
+// MacKernelSDK is based on the macOS 11 SDK. a_desc .. a_verifyblksize have the same offsets since macOS 11.
+// a_verify_ctxp and a_flags are only read to decide whether to take over; with another layout at 0x30/0x38
+// (for example macOS 11, where a_flags sits at 0x30) the wrapper passes the call on unchanged. Fields after
+// a_context, if a later release adds any, are never touched: the caller's block is reused.
+struct VerifyArgs {
+	void          *a_desc;
+	vnode_t        a_vp;
+	off_t          a_foffset;
+	uint8_t       *a_buf;
+	size_t         a_bufsize;
+	size_t        *a_verifyblksize;
+	void         **a_verify_ctxp;
+	int            a_flags;
+	vfs_context_t  a_context;
+};
+static_assert(__builtin_offsetof(VerifyArgs, a_vp) == 0x08 && __builtin_offsetof(VerifyArgs, a_buf) == 0x18 &&
+			  __builtin_offsetof(VerifyArgs, a_verifyblksize) == 0x28 && __builtin_offsetof(VerifyArgs, a_verify_ctxp) == 0x30 &&
+			  __builtin_offsetof(VerifyArgs, a_flags) == 0x38 && __builtin_offsetof(VerifyArgs, a_context) == 0x40,
+			  "unexpected layout of the vnop_verify argument block");
+
+using VerifyOp = int (*)(void *);
 
 static Site sites[MaxSites];
 static size_t siteCount;
 static File files[MaxFiles];
 static size_t fileCount;           // published with release stores, read without the lock
-static IOLock *lock;               // sites, files, snapshot, layer 1 installation
+static IOLock *lock;               // sites, files, snapshot
 static IOLock *scratchLock;        // scratch
 static uint8_t snapshot[PAGE_SIZE];
 static uint8_t scratch[MaxVerifyBlk] __attribute__((aligned(4096)));
-static thread_call_t healCall, statusCall;
-static bool tracking, healOn, firstCallLogged, statusRegistered;
+static thread_call_t healCall, statusCall, installCall;
+static bool tracking, healOn, firstCallLogged, statusRegistered, installStarted;
 static int l1State;
-static const uint8_t *verifyDesc;  // struct vnodeop_desc of vnop_verify
+static const void *verifyDesc;     // &vnop_verify_desc (struct vnodeop_desc)
 static int verifySlot = -1;
+static int vopOffset = -1;         // byte offset of v_op in struct vnode, as found
 static VerifyOp orgVerifyOp;
 static mach_vm_address_t orgPagein, sysctlParent, sysctlRegister;
 static Counters counters;
@@ -338,15 +377,21 @@ static errno_t verifyTracked(vnode_t vp, off_t foff, uint8_t *buf, size_t bufsiz
 //
 // Layer 1: the vnop_verify entry of the APFS vnode operation vector.
 //
-// The kernel's VNOP_VERIFY() (inlined or not) fills a struct vnop_verify_args and calls
-// vp->v_op[vnop_verify_desc.vdesc_offset](&args). We take over only for a tracked file, a buffer to
-// verify, no verify context and no flags: that is how decmpfs verifies a page-in. Anything else is
-// passed on unchanged (and counted as skipped when it concerns a tracked file).
+// The kernel's VNOP_VERIFY() (inlined or not) fills the argument block and calls
+// vp->v_op[vnop_verify_desc.vdesc_offset](&args). We take over only for vnop_verify's argument block, a
+// tracked file, a buffer to verify, no verify context and no flags: that is how decmpfs verifies a page-in.
+// Anything else is passed on unchanged (and counted as skipped when it concerns a tracked file).
 //
-static int wrapVerifyOp(struct vnop_verify_args *ap) {
+static int wrapVerifyOp(void *arg) {
+	auto ap = static_cast<VerifyArgs *>(arg);
 	const VerifyOp org = orgVerifyOp;
+	if (UNLIKELY(ap->a_desc != verifyDesc)) {
+		if (__atomic_load_n(&counters.badDesc, __ATOMIC_RELAXED) < 1000)
+			bump(counters.badDesc);
+		return org(arg);
+	}
 	if (LIKELY(ap->a_buf == nullptr || ap->a_bufsize == 0 || ap->a_verifyblksize == nullptr || !lookupFile(ap->a_vp, nullptr)))
-		return org(ap);
+		return org(arg);
 	bump(counters.verifyCalls);
 	const uint32_t flags = static_cast<uint32_t>(ap->a_flags);
 	if (!__atomic_exchange_n(&firstCallLogged, true, __ATOMIC_RELAXED))
@@ -356,18 +401,18 @@ static int wrapVerifyOp(struct vnop_verify_args *ap) {
 	if (ap->a_verify_ctxp != nullptr || flags != 0) {
 		bump(counters.skipped);
 		__atomic_store_n(&counters.lastSkipFlags, flags, __ATOMIC_RELAXED);
-		return org(ap);
+		return org(arg);
 	}
-	return verifyTracked(ap->a_vp, ap->a_foffset, reinterpret_cast<uint8_t *>(ap->a_buf), ap->a_bufsize, ap->a_verifyblksize,
+	return verifyTracked(ap->a_vp, ap->a_foffset, ap->a_buf, ap->a_bufsize, ap->a_verifyblksize,
 						 [ap, org](off_t o, uint8_t *b, size_t s, size_t *v) -> errno_t {
 		// Same argument block, with the range (and the block-size pointer) of this piece; restored afterwards.
 		const auto saveOff = ap->a_foffset;
 		const auto saveBuf = ap->a_buf;
 		const auto saveSize = ap->a_bufsize;
 		const auto saveVbs = ap->a_verifyblksize;
-		ap->a_foffset = static_cast<decltype(ap->a_foffset)>(o);
-		ap->a_buf = reinterpret_cast<decltype(ap->a_buf)>(b);
-		ap->a_bufsize = static_cast<decltype(ap->a_bufsize)>(s);
+		ap->a_foffset = o;
+		ap->a_buf = b;
+		ap->a_bufsize = s;
 		ap->a_verifyblksize = v;
 		errno_t r = org(ap);
 		ap->a_foffset = saveOff;
@@ -382,53 +427,96 @@ static bool kernelPointer(const void *p) {
 	return reinterpret_cast<uintptr_t>(p) >= VERIFYFIX_KERNEL_MIN;
 }
 
-// v_op is the word before the adjacent pair (v_mount, v_data), which the KPI returns.
-static void **findOpVector(vnode_t vp) {
+// struct vnode is private, but its fields v_op, v_mount and v_data are adjacent, and the KPI returns the
+// last two. Returns the word index of v_mount (so v_op is the word before it), or -1.
+static int findMountWord(vnode_t vp) {
 	const uintptr_t mp = reinterpret_cast<uintptr_t>(vnode_mount(vp));
 	const uintptr_t fsnode = reinterpret_cast<uintptr_t>(vnode_fsnode(vp));
 	if (mp == 0 || fsnode == 0)
-		return nullptr;
+		return -1;
 	auto words = reinterpret_cast<const uintptr_t *>(vp);
 	for (size_t i = VnodeScanFrom / sizeof(uintptr_t); (i + 2) * sizeof(uintptr_t) <= VnodeScanTo; i++)
 		if (words[i] == mp && words[i + 1] == fsnode)
-			return reinterpret_cast<void **>(words[i - 1]);
-	return nullptr;
+			return static_cast<int>(i);
+	return -1;
 }
 
-// Called with the lock held, from the recorder of the first patched page (bluetoothd is running by then,
-// so vnop_verify_desc has its slot). One attempt; the result is shown in sysctl debug.btlfx.
-static void installVerifyLocked(vnode_t vp) {
-	int state = L1On;
-	void **vec = nullptr;
-	const int slot = verifyDesc ? *reinterpret_cast<const volatile int *>(verifyDesc) : -1;   // vdesc_offset
+static uintptr_t wordAt(vnode_t vp, int index) {
+	return reinterpret_cast<const uintptr_t *>(vp)[index];
+}
+
+static bool onApfs(vnode_t vp) {
 	mount_t mp = vnode_mount(vp);
 	struct vfsstatfs *st = mp ? vfs_statfs(mp) : nullptr;
+	return st != nullptr && strncmp(st->f_fstypename, "apfs", sizeof("apfs")) == 0;
+}
+
+// Runs once on a thread-call thread, queued by the recorder of the first patched page (bluetoothd runs, so
+// vfs_op_init() has assigned the slots long ago). Nothing here runs in the page-fault path.
+static void installCallback(thread_call_param_t, thread_call_param_t) {
+	if (__atomic_load_n(&l1State, __ATOMIC_ACQUIRE) != L1Queued || __atomic_exchange_n(&installStarted, true, __ATOMIC_ACQ_REL))
+		return;
+	int state = L1On;
+	int word = -1;
+	void **vec = nullptr;
+	const int slot = *static_cast<const volatile int *>(verifyDesc);   // vdesc_offset
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	vnode_t vp = NULLVP;
 	if (slot <= 0 || slot >= MaxVnopSlot) {
 		state = L1NoDesc;
-	} else if (st == nullptr || strncmp(st->f_fstypename, "apfs", sizeof("apfs")) != 0) {
+	} else if (vnode_lookup(files[0].path, 0, &vp, ctx) != 0) {
+		vp = NULLVP;
+		state = L1NoVnode;
+	} else if (!onApfs(vp)) {
 		state = L1NotApfs;
-	} else if ((vec = findOpVector(vp)) == nullptr) {
+	} else if ((word = findMountWord(vp)) < 1) {
 		state = L1NoOpVector;
 	} else {
-		// Every slot of a vnode operation vector is set (vfs_fsadd fills empty ones with the default).
+		vec = reinterpret_cast<void **>(wordAt(vp, word - 1));
+		bool confirmed = false;
+		for (size_t i = 0; i < arrsize(CrossCheckFiles) && !confirmed; i++) {
+			vnode_t other = NULLVP;
+			if (vnode_lookup(CrossCheckFiles[i], 0, &other, ctx) != 0)
+				continue;
+			confirmed = other != vp && onApfs(other) && findMountWord(other) == word &&
+						wordAt(other, word - 1) == reinterpret_cast<uintptr_t>(vec);
+			vnode_put(other);
+		}
+		if (!confirmed)
+			state = L1CrossCheck;
+	}
+	if (state == L1On) {
+		// Every entry of a vnode operation vector is set (vfs_fsadd fills empty ones with the default), and
+		// APFS implements vnop_verify, so its entry is not the default one.
 		bool plausible = kernelPointer(vec);
-		for (int i = 0; plausible && i < 8; i++)
+		for (int i = 0; plausible && i <= slot; i++)
 			plausible = kernelPointer(vec[i]);
 		void *cur = plausible ? __atomic_load_n(&vec[slot], __ATOMIC_ACQUIRE) : nullptr;
 		void *wrapper = reinterpret_cast<void *>(&wrapVerifyOp);
-		if (!plausible || !kernelPointer(cur)) {
+		if (!plausible || cur == vec[0] || cur == wrapper) {
 			state = L1BadVector;
-		} else if (cur != wrapper) {
-			orgVerifyOp = reinterpret_cast<VerifyOp>(cur);
-			if (!__atomic_compare_exchange_n(&vec[slot], &cur, wrapper, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-				state = L1Raced;
+		} else {
+			orgVerifyOp = reinterpret_cast<VerifyOp>(cur);   // visible before the entry points to the wrapper
+			if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
+				state = L1WriteFailed;
+			} else {
+				const bool swapped = __atomic_compare_exchange_n(&vec[slot], &cur, wrapper, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+				MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+				if (!swapped)
+					state = L1Raced;
+			}
 		}
 	}
+	if (vp != NULLVP)
+		vnode_put(vp);
+	vfs_context_rele(ctx);
 	if (state == L1On) {
 		verifySlot = slot;
-		SYSLOG(MODULE_SHORT, "verify-fix: layer 1 on: vnop_verify of APFS hooked (vector %p, slot %d)", static_cast<void *>(vec), slot);
+		vopOffset = (word - 1) * static_cast<int>(sizeof(uintptr_t));
+		SYSLOG(MODULE_SHORT, "verify-fix: layer 1 on: vnop_verify of APFS hooked (vector %p, slot %d, v_op at 0x%x)",
+			   static_cast<void *>(vec), slot, vopOffset);
 	} else {
-		SYSLOG(MODULE_SHORT, "verify-fix: layer 1 NOT installed (state %d, slot %d)", state, slot);
+		SYSLOG(MODULE_SHORT, "verify-fix: layer 1 NOT installed (state %d, slot %d, v_mount word %d)", state, slot, word);
 	}
 	__atomic_store_n(&l1State, state, __ATOMIC_RELEASE);
 }
@@ -483,29 +571,39 @@ static int wrapPagein(struct vnop_pagein_args *ap, int *isCompressed, void *cp) 
 //
 static const char *l1Name(int s) {
 	switch (s) {
-		case L1Off:        return "off";
-		case L1Waiting:    return "waiting";
-		case L1On:         return "on";
-		case L1NoDesc:     return "fail-desc";
-		case L1NotApfs:    return "fail-notapfs";
-		case L1NoOpVector: return "fail-vnode";
-		case L1BadVector:  return "fail-vector";
-		case L1Raced:      return "fail-raced";
-		default:           return "unknown";
+		case L1Off:         return "off";
+		case L1Waiting:     return "waiting";
+		case L1Queued:      return "queued";
+		case L1On:          return "on";
+		case L1NoDesc:      return "fail-desc";
+		case L1NoVnode:     return "fail-novnode";
+		case L1NotApfs:     return "fail-notapfs";
+		case L1NoOpVector:  return "fail-vnode";
+		case L1CrossCheck:  return "fail-xcheck";
+		case L1BadVector:   return "fail-vector";
+		case L1WriteFailed: return "fail-write";
+		case L1Raced:       return "fail-raced";
+		default:            return "unknown";
 	}
 }
 
 static int statusSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req) {
-	char buf[320];
+	char buf[360];
+	char voff[16];
+	if (vopOffset >= 0)
+		snprintf(voff, sizeof(voff), "0x%x", vopOffset);
+	else
+		strlcpy(voff, "none", sizeof(voff));
 	snprintf(buf, sizeof(buf),
-			 "vf9 l1=%s slot=%d l2=%s files=%lu sites=%lu | l1: calls=%u restored=%u restore_failed=%u skipped=%u flags=0x%x"
-			 " | l2: failed_pageins=%u heals=%u heal_error=%d",
-			 l1Name(__atomic_load_n(&l1State, __ATOMIC_ACQUIRE)), verifySlot, healOn ? "on" : "off",
+			 "verifyfix r3 l1=%s slot=%d voff=%s l2=%s files=%lu sites=%lu | l1: calls=%u restored=%u restore_failed=%u skipped=%u"
+			 " flags=0x%x baddesc=%u | l2: failed_pageins=%u heals=%u heal_error=%d",
+			 l1Name(__atomic_load_n(&l1State, __ATOMIC_ACQUIRE)), verifySlot, voff, healOn ? "on" : "off",
 			 static_cast<unsigned long>(__atomic_load_n(&fileCount, __ATOMIC_ACQUIRE)),
 			 static_cast<unsigned long>(__atomic_load_n(&siteCount, __ATOMIC_RELAXED)),
 			 __atomic_load_n(&counters.verifyCalls, __ATOMIC_RELAXED), __atomic_load_n(&counters.restored, __ATOMIC_RELAXED),
 			 __atomic_load_n(&counters.restoreFailed, __ATOMIC_RELAXED), __atomic_load_n(&counters.skipped, __ATOMIC_RELAXED),
-			 __atomic_load_n(&counters.lastSkipFlags, __ATOMIC_RELAXED), __atomic_load_n(&counters.pageinFailed, __ATOMIC_RELAXED),
+			 __atomic_load_n(&counters.lastSkipFlags, __ATOMIC_RELAXED), __atomic_load_n(&counters.badDesc, __ATOMIC_RELAXED),
+			 __atomic_load_n(&counters.pageinFailed, __ATOMIC_RELAXED),
 			 __atomic_load_n(&counters.heals, __ATOMIC_RELAXED), __atomic_load_n(&counters.healError, __ATOMIC_RELAXED));
 	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
 }
@@ -548,7 +646,8 @@ static void init(KernelPatcher &patcher) {
 		lock = IOLockAlloc();
 		scratchLock = IOLockAlloc();
 		healCall = thread_call_allocate(healCallback, nullptr);
-		if (lock == nullptr || scratchLock == nullptr || healCall == nullptr) {
+		installCall = thread_call_allocate(installCallback, nullptr);
+		if (lock == nullptr || scratchLock == nullptr || healCall == nullptr || installCall == nullptr) {
 			SYSLOG(MODULE_SHORT, "verify-fix: allocation failed, disabled");
 			wantVerify = wantHeal = false;
 		}
@@ -569,7 +668,7 @@ static void init(KernelPatcher &patcher) {
 			patcher.clearError();
 		const char *name = desc ? *reinterpret_cast<const char * const *>(desc + sizeof(void *)) : nullptr;   // vdesc_name
 		if (name != nullptr && kernelPointer(name) && strcmp(name, "vnop_verify") == 0) {
-			verifyDesc = reinterpret_cast<const uint8_t *>(desc);
+			verifyDesc = reinterpret_cast<const void *>(desc);
 			l1State = L1Waiting;
 		} else {
 			l1State = L1NoDesc;
@@ -577,7 +676,7 @@ static void init(KernelPatcher &patcher) {
 	}
 
 	tracking = healOn || l1State == L1Waiting;
-	SYSLOG(MODULE_SHORT, "verify-fix r2: layer 1 %s, layer 2 %s, status sysctl %s", l1Name(l1State), healOn ? "on" : "off",
+	SYSLOG(MODULE_SHORT, "verify-fix r3: layer 1 %s, layer 2 %s, status sysctl %s", l1Name(l1State), healOn ? "on" : "off",
 		   sysctlRegister ? "in 30 s" : "unavailable");
 }
 
@@ -591,7 +690,7 @@ static void init(KernelPatcher &patcher) {
 // after the last patch of that page, it records every byte run that the patches changed. So every
 // patch in BlueToolFixup.cpp is covered, including patches added later (for example the Fast-Connect
 // A2DP gate of the BlueToolFixup-FixA2DP fork), without changing any patch code. The first time a
-// patch is recorded, it also installs layer 1 from the same vnode.
+// patch is recorded, it queues the installation of layer 1 (installCallback).
 //
 class PatchRecorder {
 	vnode_t mVnode;
@@ -618,8 +717,10 @@ public:
 		if (!mActive)
 			return;
 		recordLocked(mVnode, mPath, mOffset, snapshot, mPage);
-		if (l1State == L1Waiting && lookupFile(mVnode, nullptr))
-			installVerifyLocked(mVnode);
+		if (__atomic_load_n(&l1State, __ATOMIC_ACQUIRE) == L1Waiting && lookupFile(mVnode, nullptr)) {
+			__atomic_store_n(&l1State, L1Queued, __ATOMIC_RELEASE);
+			thread_call_enter(installCall);
+		}
 		IOLockUnlock(lock);
 	}
 
